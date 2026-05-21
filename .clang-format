@@ -1,0 +1,37 @@
+---
+# C++ code style for rknn project
+# Based on Google C++ Style Guide, adapted with 4-space indent
+BasedOnStyle: Google
+
+# ── Indentation ──────────────────────────────────────────────────────────────
+IndentWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4          # aligns public/private with class body indent
+ConstructorInitializerIndentWidth: 4
+# ── Line length ───────────────────────────────────────────────────────────────
+ColumnLimit: 100
+
+# ── Braces ────────────────────────────────────────────────────────────────────
+BreakBeforeBraces: Attach         # K&R style: braces on same line
+
+# ── Pointers / references ─────────────────────────────────────────────────────
+PointerAlignment: Left            # int* p, not int *p
+
+# ── Includes ──────────────────────────────────────────────────────────────────
+SortIncludes: false               # preserve manual include ordering
+
+# ── Function / class formatting ───────────────────────────────────────────────
+AllowShortFunctionsOnASingleLine: Inline   # allow trivial one-liners
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: Yes
+
+# ── Argument / parameter packing ──────────────────────────────────────────────
+BinPackParameters: false          # each param on its own line if they don't fit
+BinPackArguments: false
+AlignAfterOpenBracket: Align
+
+# ── Spaces ────────────────────────────────────────────────────────────────────
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: false
+SpaceAfterCStyleCast: false

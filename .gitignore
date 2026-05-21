@@ -1,0 +1,35 @@
+# Build outputs
+build/
+cmake-build-*/
+*.o
+*.a
+
+# Datasets and indexes (provide via DATA/ or absolute paths)
+DATA/
+*.fvecs
+*.ivecs
+*.fbin
+*.bin
+*.index
+*.idx
+
+# Results / logs / figures
+results/
+logs/
+figure/
+*.log
+*.png
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors
+.idea/
+.vscode/
+.DS_Store
+*.bak
+*.swp
