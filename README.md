@@ -200,5 +200,13 @@ preset live in [`scripts/example_build.sh`](scripts/example_build.sh) and
 ## 5. Citation
 
 ```
-CITATION_BIBTEX_TBD
+@misc{xia2026hrnnhybridgraphindex,
+      title={HRNN: A Hybrid Graph Index for Approximate Reverse k-Nearest Neighbor Search on High-Dimensional Vectors}, 
+      author={Wenxuan Xia and Mingyu Yang and Wentao Li and Wei Wang},
+      year={2026},
+      eprint={2606.03225},
+      archivePrefix={arXiv},
+      primaryClass={cs.DB},
+      url={https://arxiv.org/abs/2606.03225}, 
+}
 ```
