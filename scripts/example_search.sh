@@ -22,7 +22,7 @@ echo "=== HRNN search (main method) ==="
     --query      "${QUERY}" \
     --gt         "${RKNN_GT}" \
     --k          "${K}" \
-    --K_prime    500 \
+    --K_prime    100 \
     --m          "1,3,5,10,20,50" \
     --ef_search  200
 

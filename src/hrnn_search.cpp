@@ -63,8 +63,8 @@ int main(int argc, char* argv[]) {
         ("k", po::value<int>(&k)->default_value(10),
          "RkNN k parameter")
 
-        ("K_prime", po::value<int>(&K_prime)->default_value(500),
-         "KNNG K' truncation (use first K' reverse entries)")
+        ("K_prime", po::value<int>(&K_prime)->default_value(100),
+         "KNNG rank cutoff for reverse postings (keep forward rank < K')")
 
         ("m", po::value<std::string>(&m_str)->default_value("1,3,5,10,20,50"),
          "Proxy counts to sweep (comma-separated)")

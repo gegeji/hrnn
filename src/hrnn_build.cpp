@@ -23,7 +23,7 @@ int main(int argc, char *argv[]) {
         ("ef_construction", po::value<int>(&ef_construction)->default_value(200),
          "HNSW ef_construction parameter")
 
-        ("K_knng", po::value<int>(&K_knng)->default_value(500),
+        ("K_knng", po::value<int>(&K_knng)->default_value(100),
          "KNNG depth (K nearest neighbors to store per node)")
 
         ("nn_iters", po::value<int>(&nn_iters)->default_value(3),

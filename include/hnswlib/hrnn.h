@@ -13,6 +13,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -81,12 +85,11 @@ class HRNN : public AlgorithmInterface<dist_t> {
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
     // ---- KNNG / RKNNG fields ----
-    size_t K_knng_{0};              // KNN graph depth (e.g. 500)
+    size_t K_knng_{0};              // stored KNN graph depth (e.g. 100)
     size_t size_knng_slot_{0};      // bytes for KNNG slot per node
     size_t offsetKNNG_{0};          // offset to KNNG in level-0 memory
     bool knng_built_{false};
     bool rknng_built_{false};
-
     // RKNNG CSR storage — dual-width: narrow (uint32) or wide (uint64)
     bool rknng_wide_{false};
     std::vector<uint64_t> rknng_offsets_;     // always uint64_t (only n+1 elements)
@@ -104,6 +107,10 @@ class HRNN : public AlgorithmInterface<dist_t> {
     std::vector<std::vector<uint32_t>> rknng_lists_;
     bool rknng_mutable_{false};
 
+    // Prevents overlapping batch-deletion calls. The caller must stop queries,
+    // insertions, and point updates while deleteBatch() compacts the KNNG rows
+    // and replaces the reverse CSR.
+    std::mutex deletion_batch_lock_;
     // ---- Serve mode: compact element layout (KNNG removed) ----
     bool serve_mode_{false};
     float* kdist_matrix_{nullptr};    // dense [n × max_k_serve_] row-major distances
@@ -285,10 +292,16 @@ class HRNN : public AlgorithmInterface<dist_t> {
     // Get kdist_sq for verification (works in both serve and normal mode)
     inline float getVerifyKdistSq(tableint id, unsigned k_idx) const {
         if (serve_mode_) {
+            if (k_idx >= max_k_serve_)
+                throw std::runtime_error(
+                    "getVerifyKdistSq: requested k exceeds compact serving depth");
             return kdist_matrix_[static_cast<size_t>(id) * max_k_serve_ + k_idx];
         }
         unsigned cnt = getListCount(get_knng_linklist(id));
-        if (k_idx >= cnt) return std::numeric_limits<float>::max();
+        // A filtered row shorter than the requested k has no k-th surviving
+        // neighbor. Negative infinity makes the verification predicate fail, so
+        // the owner is skipped instead of being accepted for every query.
+        if (k_idx >= cnt) return -std::numeric_limits<float>::infinity();
         return get_knng_dist(id, k_idx);
     }
 
@@ -298,11 +311,13 @@ class HRNN : public AlgorithmInterface<dist_t> {
     // The on-disk index is NOT modified — this is a load-time optimization.
     void compactForServing(size_t max_k_serve) {
         if (serve_mode_) return;
+        if (num_deleted_.load() != 0)
+            throw std::runtime_error(
+                "compactForServing: tombstoned indexes must remain in the full index format");
         if (K_knng_ == 0 || !knng_built_)
             throw std::runtime_error("compactForServing: KNNG not built");
         if (max_k_serve == 0 || max_k_serve > K_knng_)
             throw std::runtime_error("compactForServing: max_k_serve must be in [1, K_knng]");
-
         size_t n = cur_element_count;
         max_k_serve_ = max_k_serve;
         size_t old_elem_size = size_data_per_element_;
@@ -316,7 +331,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
             for (size_t j = 0; j < max_k_serve; j++) {
                 kdist_matrix_[i * max_k_serve + j] =
                     (j < cnt) ? get_knng_dist((tableint)i, (unsigned)j)
-                              : std::numeric_limits<float>::max();
+                              : -std::numeric_limits<float>::infinity();
             }
         }
 
@@ -379,6 +394,8 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 (double)sz / (1024.0 * 1024.0 * 1024.0));
 #endif
     }
+
+    // ---- Core HNSW utilities and graph search ----
 
     int getRandomLevel(double reverse_size) {
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
@@ -831,6 +848,8 @@ class HRNN : public AlgorithmInterface<dist_t> {
         max_elements_ = new_max_elements;
     }
 
+    // ---- Index serialization ----
+
     size_t indexFileSize() const {
         size_t size = 0;
         size += sizeof(offsetLevel0_);
@@ -859,6 +878,9 @@ class HRNN : public AlgorithmInterface<dist_t> {
     }
 
     void saveIndex(const std::string &location) {
+        if (serve_mode_)
+            throw std::runtime_error(
+                "saveIndex: compactForServing is an in-memory-only layout and cannot be saved");
         std::ofstream output(location, std::ios::binary);
 
         // Magic header
@@ -929,13 +951,21 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
     void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
         std::ifstream input(location, std::ios::binary);
-
         if (!input.is_open())
             throw std::runtime_error("Cannot open file");
 
         clear();
+        num_deleted_.store(0);
+        label_lookup_.clear();
+        deleted_elements.clear();
+        rknng_offsets_.clear();
+        rknng_entries_32_.clear();
+        rknng_entries_64_.clear();
+        rknng_lists_.clear();
+        rknng_mutable_ = false;
+        serve_mode_ = false;
+        max_k_serve_ = 0;
 
-        // Read and verify magic
         uint32_t magic;
         readBinaryPOD(input, magic);
         if (magic != 0x4E4E5248)
@@ -961,7 +991,6 @@ class HRNN : public AlgorithmInterface<dist_t> {
         readBinaryPOD(input, mult_);
         readBinaryPOD(input, ef_construction_);
 
-        // KNNG/RKNNG header fields
         readBinaryPOD(input, K_knng_);
         readBinaryPOD(input, size_knng_slot_);
         readBinaryPOD(input, offsetKNNG_);
@@ -972,18 +1001,15 @@ class HRNN : public AlgorithmInterface<dist_t> {
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
 
-        // Read level-0 data (includes KNNG slots)
         data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
         input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
-
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
         std::vector<std::mutex>(max_elements).swap(link_list_locks_);
         std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
-
         visited_list_pool_.reset(new VisitedListPool(1, max_elements));
 
         linkLists_ = (char **) malloc(sizeof(void *) * max_elements);
@@ -1008,7 +1034,6 @@ class HRNN : public AlgorithmInterface<dist_t> {
             }
         }
 
-        // Load RKNNG CSR data (dual-width format)
         if (rknng_built_) {
             uint8_t entry_bytes;
             readBinaryPOD(input, entry_bytes);
@@ -1039,13 +1064,14 @@ class HRNN : public AlgorithmInterface<dist_t> {
         for (size_t i = 0; i < cur_element_count; i++) {
             if (isMarkedDeleted(i)) {
                 num_deleted_ += 1;
-                if (allow_replace_deleted_) deleted_elements.insert(i);
+                if (allow_replace_deleted_)
+                    deleted_elements.insert(i);
             }
         }
-
         input.close();
     }
 
+    // ---- Label and vector access ----
 
     template<typename data_t>
     std::vector<data_t> getDataByLabel(labeltype label) const {
@@ -1071,11 +1097,18 @@ class HRNN : public AlgorithmInterface<dist_t> {
         return data;
     }
 
+    // ---- HNSW deletion marks ----
 
     /*
-    * Marks an element with the given label deleted, does NOT really change the current graph.
+    * Marks an element deleted in HNSW without removing its routing links.
+    * Once KNNG/RKNNG has been built, use deleteBatch() so all three structures
+    * remain synchronized.
     */
     void markDelete(labeltype label) {
+        if (knng_built_ || rknng_built_) {
+            throw std::runtime_error(
+                "markDelete: use deleteBatch so KNNG/RKNNG remain synchronized");
+        }
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
 
@@ -1092,10 +1125,20 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     /*
-    * Uses the last 16 bits of the memory for the linked list size to store the mark,
-    * whereas maxM0_ has to be limited to the lower 16 bits, however, still large enough in almost all cases.
+    * Internal HNSW-only form of markDelete(). Once KNNG/RKNNG has been built,
+    * deletion must go through deleteBatch(). The flag is stored in the level-0
+    * link-list header.
     */
     void markDeletedInternal(tableint internalId) {
+        if (knng_built_ || rknng_built_) {
+            throw std::runtime_error(
+                "markDeletedInternal: use deleteBatch so KNNG/RKNNG remain synchronized");
+        }
+        markDeletedInternalUnchecked(internalId);
+    }
+
+ private:
+    void markDeletedInternalUnchecked(tableint internalId) {
         assert(internalId < cur_element_count);
         if (!isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId))+2;
@@ -1110,14 +1153,18 @@ class HRNN : public AlgorithmInterface<dist_t> {
         }
     }
 
+ public:
 
     /*
-    * Removes the deleted mark of the node, does NOT really change the current graph.
-    * 
-    * Note: the method is not safe to use when replacement of deleted elements is enabled,
-    *  because elements marked as deleted can be completely removed by addPoint
+    * Clears an HNSW-only deletion mark. Reviving a point is unavailable once
+    * KNNG/RKNNG has been built because the coupled structures would need a full
+    * rebuild.
     */
     void unmarkDelete(labeltype label) {
+        if (knng_built_ || rknng_built_) {
+            throw std::runtime_error(
+                "unmarkDelete: reviving a deleted ID would invalidate KNNG/RKNNG; rebuild the index instead");
+        }
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
 
@@ -1135,9 +1182,13 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     /*
-    * Remove the deleted mark of the node.
+    * Internal form of unmarkDelete(); only valid before KNNG/RKNNG construction.
     */
     void unmarkDeletedInternal(tableint internalId) {
+        if (knng_built_ || rknng_built_) {
+            throw std::runtime_error(
+                "unmarkDeletedInternal: reviving a deleted ID would invalidate KNNG/RKNNG");
+        }
         assert(internalId < cur_element_count);
         if (isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId)) + 2;
@@ -1154,13 +1205,14 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     /*
-    * Checks the first 16 bits of the memory to see if the element is marked deleted.
+    * Checks the deletion flag stored in the level-0 link-list header.
     */
     bool isMarkedDeleted(tableint internalId) const {
         unsigned char *ll_cur = ((unsigned char*)get_linklist0(internalId)) + 2;
         return *ll_cur & DELETE_MARK;
     }
 
+    // ---- Link-list metadata ----
 
     unsigned short int getListCount(linklistsizeint * ptr) const {
         return *((unsigned short int *)ptr);
@@ -1171,14 +1223,20 @@ class HRNN : public AlgorithmInterface<dist_t> {
         *((unsigned short int*)(ptr))=*((unsigned short int *)&size);
     }
 
+    // ---- Point insertion and update ----
 
     /*
-    * Adds point. Updates the point if it is already in the index.
-    * If replacement of deleted elements is enabled: replaces previously deleted point if any, updating it with new point
+    * Adds a point or updates an existing label. Deleted-slot replacement is
+    * available only before KNNG/RKNNG construction; a coupled HRNN index must
+    * be rebuilt before a deleted internal ID can be reused.
     */
     void addPoint(const void *data_point, labeltype label, bool replace_deleted = false) {
         if ((allow_replace_deleted_ == false) && (replace_deleted == true)) {
             throw std::runtime_error("Replacement of deleted elements is disabled in constructor");
+        }
+        if (replace_deleted && (knng_built_ || rknng_built_)) {
+            throw std::runtime_error(
+                "addPoint: deleted internal-ID reuse is incompatible with KNNG/RKNNG state");
         }
 
         // lock all operations with element by label
@@ -1218,6 +1276,10 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     void updatePoint(const void *dataPoint, tableint internalId, float updateNeighborProbability) {
+        if (num_deleted_.load() != 0 && (knng_built_ || rknng_built_)) {
+            throw std::runtime_error(
+                "updatePoint: mixed insertion/update after maintained deletion requires a full rebuild");
+        }
         // update the feature vector associated with existing point with new vector
         memcpy(getDataByInternalId(internalId), dataPoint, data_size_);
 
@@ -1376,6 +1438,10 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     tableint addPoint(const void *data_point, labeltype label, int level) {
+        if (num_deleted_.load() != 0 && (knng_built_ || rknng_built_)) {
+            throw std::runtime_error(
+                "addPoint: mixed insertion/update after maintained deletion requires a full rebuild");
+        }
         tableint cur_c = 0;
         {
             // Checking if the element with the same label already exists
@@ -1384,16 +1450,14 @@ class HRNN : public AlgorithmInterface<dist_t> {
             auto search = label_lookup_.find(label);
             if (search != label_lookup_.end()) {
                 tableint existingInternalId = search->second;
-                if (allow_replace_deleted_) {
-                    if (isMarkedDeleted(existingInternalId)) {
-                        throw std::runtime_error("Can't use addPoint to update deleted elements if replacement of deleted elements is enabled.");
-                    }
+                const bool revive_deleted = isMarkedDeleted(existingInternalId);
+                if (revive_deleted && (knng_built_ || rknng_built_)) {
+                    throw std::runtime_error(
+                        "addPoint: a deleted label cannot be revived; rebuild the index instead");
                 }
                 lock_table.unlock();
-
-                if (isMarkedDeleted(existingInternalId)) {
+                if (revive_deleted)
                     unmarkDeletedInternal(existingInternalId);
-                }
                 updatePoint(data_point, existingInternalId, 1.0);
 
                 return existingInternalId;
@@ -1518,7 +1582,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     // ========================================================================
-    // KNNG refinement via NNDescent-style local join
+    // KNNG update helpers and NNDescent refinement
     // ========================================================================
 
     bool try_update_knng(tableint u, tableint w, dist_t d) {
@@ -1723,6 +1787,9 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     void refineKNNG(int num_iters = 3, int sample_size = 20) {
+        if (num_deleted_.load() != 0)
+            throw std::runtime_error(
+                "refineKNNG: tombstoned indexes require a full rebuild before refinement");
         size_t n = cur_element_count;
         unsigned S = (unsigned)sample_size;
         unsigned R = S;  // reverse neighbor cap
@@ -1863,74 +1930,251 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
 
     // ========================================================================
+    // Lightweight batch deletion
+    // ========================================================================
+
+    struct DeleteBatchStats {
+        size_t requested{0};
+        size_t newly_deleted{0};
+        size_t affected_rows{0};
+        size_t removed_entries{0};
+        size_t unservable_rows{0};
+    };
+
+    // Offline lightweight batch deletion for HRNN's coupled HNSW, KNNG, and
+    // RKNNG state. The caller must stop queries, insertions, and updates for the
+    // entire call. Deleted HNSW vertices remain linked and traversable, while
+    // deleted entries are stably filtered from every live ranked KNNG row. The
+    // reverse CSR is then rebuilt as the exact transpose of the filtered rows.
+    //
+    // This operation performs no distance computation, graph search, neighbor
+    // refill, NNDescent step, or HNSW rewiring. A live row with fewer than k
+    // surviving entries is kept but cannot provide a k-th verification radius;
+    // query verification skips that row.
+    DeleteBatchStats deleteBatch(
+        const std::vector<labeltype>& labels, size_t k) {
+        std::lock_guard<std::mutex> batch_lock(deletion_batch_lock_);
+
+        DeleteBatchStats stats;
+        stats.requested = labels.size();
+
+        if (serve_mode_)
+            throw std::runtime_error(
+                "deleteBatch: compactForServing removed the KNNG; reload the full index first");
+        if (!knng_built_ || K_knng_ == 0)
+            throw std::runtime_error("deleteBatch: KNNG not built");
+        if (k == 0 || k > K_knng_)
+            throw std::runtime_error("deleteBatch: k must be in [1, K_knng]");
+        if (allow_replace_deleted_)
+            throw std::runtime_error(
+                "deleteBatch: construct HRNN with allow_replace_deleted=false");
+        if (rknng_mutable_)
+            throw std::runtime_error(
+                "deleteBatch: insertion/update-maintained reverse lists require a full rebuild before deletion");
+        if (labels.empty())
+            return stats;
+
+        const size_t n = cur_element_count;
+        const size_t entry_size = sizeof(tableint) + sizeof(float);
+
+        // Resolve and validate the entire request before mutating any index state.
+        std::vector<tableint> ids;
+        ids.reserve(labels.size());
+        {
+            std::lock_guard<std::mutex> table_lock(label_lookup_lock);
+            for (labeltype label : labels) {
+                auto it = label_lookup_.find(label);
+                if (it == label_lookup_.end()) {
+                    throw std::runtime_error(
+                        "deleteBatch: label not found: " + std::to_string(label));
+                }
+                ids.push_back(it->second);
+            }
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+        size_t pending_deletions = 0;
+        for (tableint id : ids) {
+            if (!isMarkedDeleted(id))
+                pending_deletions++;
+        }
+        const size_t active_count_before = n - num_deleted_.load();
+        const size_t active_count_after =
+            active_count_before >= pending_deletions
+                ? active_count_before - pending_deletions
+                : 0;
+        if (active_count_before < pending_deletions
+            || (pending_deletions != 0 && active_count_after <= k)) {
+            throw std::runtime_error(
+                "deleteBatch: refusing batch before mutation because only "
+                + std::to_string(active_count_after)
+                + " active points would remain, but a k="
+                + std::to_string(k)
+                + " query needs at least k+1 active points");
+        }
+
+        rknng_built_ = false;
+        rknng_mutable_ = false;
+        rknng_lists_.clear();
+
+        for (tableint id : ids) {
+            if (!isMarkedDeleted(id)) {
+                markDeletedInternalUnchecked(id);
+                stats.newly_deleted++;
+            }
+        }
+
+        size_t affected_rows = 0;
+        size_t removed_entries = 0;
+        size_t unservable_rows = 0;
+        #pragma omp parallel for reduction(+:affected_rows, removed_entries, unservable_rows) schedule(static)
+        for (long long owner_index = 0;
+             owner_index < static_cast<long long>(n);
+             owner_index++) {
+            const tableint owner = static_cast<tableint>(owner_index);
+            if (isMarkedDeleted(owner))
+                continue;
+
+            linklistsizeint* row = get_knng_linklist(owner);
+            char* entries = reinterpret_cast<char*>(row + 1);
+            const unsigned old_count = getListCount(row);
+            unsigned write = 0;
+            for (unsigned read = 0; read < old_count; read++) {
+                tableint neighbor;
+                memcpy(&neighbor, entries + read * entry_size, sizeof(tableint));
+                if (isMarkedDeleted(neighbor)) {
+                    removed_entries++;
+                    continue;
+                }
+                if (write != read) {
+                    memmove(
+                        entries + write * entry_size,
+                        entries + read * entry_size,
+                        entry_size);
+                }
+                write++;
+            }
+            if (write != old_count)
+                affected_rows++;
+            setListCount(row, write);
+            if (write < k)
+                unservable_rows++;
+        }
+        stats.affected_rows = affected_rows;
+        stats.removed_entries = removed_entries;
+        stats.unservable_rows = unservable_rows;
+
+        buildRKNNG();
+        return stats;
+    }
+
+    // ========================================================================
     // RKNNG construction (CSR transpose of KNNG)
     // ========================================================================
 
     void buildRKNNG() {
         if (!knng_built_)
             throw std::runtime_error("buildRKNNG: KNNG not built yet");
-        size_t n = cur_element_count;
+        rknng_built_ = false;
+        const size_t n = cur_element_count;
 
-        // Compute bit-packing parameters
         rknng_rank_bits_ = 0;
-        while ((1u << rknng_rank_bits_) < K_knng_) rknng_rank_bits_++;
+        while ((uint64_t{1} << rknng_rank_bits_) < K_knng_)
+            rknng_rank_bits_++;
         unsigned node_bits = 0;
-        while ((1ull << node_bits) < n) node_bits++;
+        while ((uint64_t{1} << node_bits) < n)
+            node_bits++;
 
-        rknng_wide_ = (node_bits + rknng_rank_bits_ > 32);
-
-        if (node_bits + rknng_rank_bits_ > 64)
-            throw std::runtime_error("buildRKNNG: exceeds 64-bit packing (n=" + std::to_string(n)
-                + " needs " + std::to_string(node_bits) + " bits, K=" + std::to_string(K_knng_)
-                + " needs " + std::to_string(rknng_rank_bits_) + " bits)");
-
-        std::cout << "    buildRKNNG: node_bits=" << node_bits
-                  << " rank_bits=" << rknng_rank_bits_
-                  << " wide=" << rknng_wide_ << std::endl;
-
-        // Count reverse references (offsets always uint64_t)
-        rknng_offsets_.assign(n + 1, 0);
-        for (size_t i = 0; i < n; i++) {
-            unsigned cnt = getListCount(get_knng_linklist((tableint)i));
-            for (unsigned j = 0; j < cnt; j++)
-                rknng_offsets_[get_knng_neighbor((tableint)i, j) + 1]++;
+        if (node_bits + rknng_rank_bits_ > 64) {
+            throw std::runtime_error(
+                "buildRKNNG: exceeds 64-bit packing (n="
+                + std::to_string(n)
+                + " needs " + std::to_string(node_bits)
+                + " bits, K=" + std::to_string(K_knng_)
+                + " needs " + std::to_string(rknng_rank_bits_)
+                + " bits)");
         }
-        // Prefix sum
-        for (size_t i = 1; i <= n; i++)
-            rknng_offsets_[i] += rknng_offsets_[i - 1];
+        rknng_wide_ = node_bits + rknng_rank_bits_ > 32;
 
-        // Fill and sort entries (templated on entry width)
-        if (rknng_wide_)
-            buildRKNNG_fill<uint64_t>(rknng_entries_64_, rknng_rank_mask_64_);
-        else
-            buildRKNNG_fill<uint32_t>(rknng_entries_32_, rknng_rank_mask_32_);
+        // Count the exact transpose of live ranked rows. This intentionally uses
+        // one deterministic pass: it avoids depending on the number of OpenMP
+        // workers that a runtime actually grants under dynamic teams, thread
+        // limits, or nested execution.
+        rknng_offsets_.assign(n + 1, 0);
+        for (size_t owner_index = 0; owner_index < n; owner_index++) {
+            const tableint owner = static_cast<tableint>(owner_index);
+            if (isMarkedDeleted(owner))
+                continue;
+            const unsigned count =
+                getListCount(get_knng_linklist(owner));
+            for (unsigned rank = 0; rank < count; rank++) {
+                const tableint neighbor = get_knng_neighbor(owner, rank);
+                if (neighbor < n && !isMarkedDeleted(neighbor))
+                    rknng_offsets_[neighbor + 1]++;
+            }
+        }
+        for (size_t target = 1; target <= n; target++)
+            rknng_offsets_[target] += rknng_offsets_[target - 1];
+
+        if (rknng_wide_) {
+            buildRKNNG_fill<uint64_t>(
+                rknng_entries_64_, rknng_rank_mask_64_);
+            rknng_entries_32_.clear();
+        } else {
+            buildRKNNG_fill<uint32_t>(
+                rknng_entries_32_, rknng_rank_mask_32_);
+            rknng_entries_64_.clear();
+        }
 
         rknng_built_ = true;
-        std::cout << "    buildRKNNG: total_entries=" << rknng_offsets_[cur_element_count] << std::endl;
+        std::cout << "    buildRKNNG: node_bits=" << node_bits
+                  << " rank_bits=" << rknng_rank_bits_
+                  << " wide=" << rknng_wide_
+                  << " total_entries=" << rknng_offsets_[n]
+                  << std::endl;
     }
 
     template <typename EntryT>
-    void buildRKNNG_fill(std::vector<EntryT>& entries, EntryT& rank_mask) {
-        size_t n = cur_element_count;
-        rank_mask = (EntryT(1) << rknng_rank_bits_) - 1;
+    void buildRKNNG_fill(
+        std::vector<EntryT>& entries,
+        EntryT& rank_mask) {
+        const size_t n = cur_element_count;
+        rank_mask = (EntryT{1} << rknng_rank_bits_) - 1;
         entries.resize(rknng_offsets_[n]);
-        std::vector<uint64_t> pos(rknng_offsets_.begin(), rknng_offsets_.end());
+        if (entries.empty())
+            return;
+        std::vector<uint64_t> positions(
+            rknng_offsets_.begin(), rknng_offsets_.end());
 
-        for (size_t i = 0; i < n; i++) {
-            unsigned cnt = getListCount(get_knng_linklist((tableint)i));
-            for (unsigned j = 0; j < cnt; j++) {
-                tableint nbr = get_knng_neighbor((tableint)i, j);
-                entries[pos[nbr]++] = (EntryT(i) << rknng_rank_bits_) | j;
+        for (size_t owner_index = 0; owner_index < n; owner_index++) {
+            const tableint owner = static_cast<tableint>(owner_index);
+            if (isMarkedDeleted(owner))
+                continue;
+            const unsigned count =
+                getListCount(get_knng_linklist(owner));
+            for (unsigned rank = 0; rank < count; rank++) {
+                const tableint neighbor = get_knng_neighbor(owner, rank);
+                if (neighbor >= n || isMarkedDeleted(neighbor))
+                    continue;
+                entries[positions[neighbor]++] =
+                    (EntryT(owner) << rknng_rank_bits_) | rank;
             }
         }
 
-        // Sort each node's reverse list by rank (for K' prefix scan)
-        for (size_t b = 0; b < n; b++) {
-            auto* beg = entries.data() + rknng_offsets_[b];
-            auto* en  = entries.data() + rknng_offsets_[b + 1];
-            std::sort(beg, en, [mask = rank_mask](EntryT a, EntryT b) {
-                return (a & mask) < (b & mask);
-            });
+        for (size_t target = 0; target < n; target++) {
+            auto* begin = entries.data() + rknng_offsets_[target];
+            auto* end = entries.data() + rknng_offsets_[target + 1];
+            std::sort(
+                begin,
+                end,
+                [mask = rank_mask, bits = rknng_rank_bits_](EntryT a, EntryT b) {
+                    const EntryT a_rank = a & mask;
+                    const EntryT b_rank = b & mask;
+                    if (a_rank != b_rank)
+                        return a_rank < b_rank;
+                    return (a >> bits) < (b >> bits);
+                });
         }
     }
 
@@ -1940,6 +2184,9 @@ class HRNN : public AlgorithmInterface<dist_t> {
     // ========================================================================
 
     void buildRKNNG_mutable() {
+        if (num_deleted_.load() != 0)
+            throw std::runtime_error(
+                "buildRKNNG_mutable: tombstoned indexes do not support insertion/update maintenance");
         if (!knng_built_)
             throw std::runtime_error("buildRKNNG_mutable: KNNG not built yet");
         size_t n = cur_element_count;
@@ -1947,9 +2194,11 @@ class HRNN : public AlgorithmInterface<dist_t> {
         rknng_lists_.assign(max_elements_, {});
         size_t total = 0;
         for (size_t i = 0; i < n; i++) {
+            if (isMarkedDeleted((tableint)i)) continue;
             unsigned cnt = getListCount(get_knng_linklist((tableint)i));
             for (unsigned j = 0; j < cnt; j++) {
                 tableint nbr = get_knng_neighbor((tableint)i, j);
+                if (nbr >= n || isMarkedDeleted(nbr)) continue;
                 rknng_lists_[nbr].push_back((uint32_t)i);
                 total++;
             }
@@ -1984,6 +2233,13 @@ class HRNN : public AlgorithmInterface<dist_t> {
     {
         if (!rknng_built_)
             throw std::runtime_error("searchRknn: RKNNG not built");
+        if (k_rknn == 0 || k_rknn > K_knng_)
+            throw std::runtime_error("searchRknn: k_rknn must be in [1, K_knng]");
+        if (serve_mode_ && k_rknn > max_k_serve_)
+            throw std::runtime_error(
+                "searchRknn: k_rknn exceeds compact serving depth");
+        if (K_prime == 0 || K_prime > K_knng_)
+            throw std::runtime_error("searchRknn: K_prime must be in [1, K_knng]");
         if (cur_element_count == 0) return {};
 
         thread_local std::vector<float> score_buf;
@@ -2013,8 +2269,14 @@ class HRNN : public AlgorithmInterface<dist_t> {
         }
 
         // Base layer search for m proxies
-        auto top_candidates = searchBaseLayerST<true>(
-            currObj, query_data, std::max(ef_search, m));
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        if (num_deleted_ == 0)
+            top_candidates = searchBaseLayerST<true>(
+                currObj, query_data, std::max(ef_search, m));
+        else
+            top_candidates = searchBaseLayerST<false>(
+                currObj, query_data, std::max(ef_search, m));
         while (top_candidates.size() > m)
             top_candidates.pop();
 
@@ -2023,6 +2285,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
         while (!top_candidates.empty()) {
             tableint proxy = top_candidates.top().second;
             top_candidates.pop();
+            if (isMarkedDeleted(proxy)) continue;
 
             uint64_t begin = rknng_offsets_[proxy];
             uint64_t end = rknng_offsets_[proxy + 1];
@@ -2031,6 +2294,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 uint32_t rank = (uint32_t)(packed & rknng_rank_mask);
                 if (rank >= K_prime) break;  // sorted by rank → prefix scan
                 uint32_t cand = (uint32_t)(packed >> rknng_rank_bits_);
+                if (isMarkedDeleted(cand)) continue;
                 if (score_buf[cand] == 0.0f) candidates.push_back(cand);
                 score_buf[cand] += 1.0f;
             }
@@ -2061,6 +2325,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 _mm_prefetch(getDataByInternalId(candidates[i + 8]), _MM_HINT_T0);
 #endif
             uint32_t cand = candidates[i];
+            if (isMarkedDeleted(cand)) continue;
             dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
             float kdist_sq = getVerifyKdistSq(cand, k_idx);
             if (d <= kdist_sq) {
@@ -2108,6 +2373,15 @@ class HRNN : public AlgorithmInterface<dist_t> {
 
         if (!rknng_built_)
             throw std::runtime_error("searchRknn_profiled: RKNNG not built");
+        if (k_rknn == 0 || k_rknn > K_knng_)
+            throw std::runtime_error(
+                "searchRknn_profiled: k_rknn must be in [1, K_knng]");
+        if (serve_mode_ && k_rknn > max_k_serve_)
+            throw std::runtime_error(
+                "searchRknn_profiled: k_rknn exceeds compact serving depth");
+        if (K_prime == 0 || K_prime > K_knng_)
+            throw std::runtime_error(
+                "searchRknn_profiled: K_prime must be in [1, K_knng]");
         if (cur_element_count == 0) return {};
 
         thread_local std::vector<float> score_buf;
@@ -2136,8 +2410,14 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 }
             }
         }
-        auto top_candidates = searchBaseLayerST<true>(
-            currObj, query_data, std::max(ef_search, m));
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        if (num_deleted_ == 0)
+            top_candidates = searchBaseLayerST<true>(
+                currObj, query_data, std::max(ef_search, m));
+        else
+            top_candidates = searchBaseLayerST<false>(
+                currObj, query_data, std::max(ef_search, m));
         while (top_candidates.size() > m)
             top_candidates.pop();
 
@@ -2148,6 +2428,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
         while (!top_candidates.empty()) {
             tableint proxy = top_candidates.top().second;
             top_candidates.pop();
+            if (isMarkedDeleted(proxy)) continue;
             uint64_t begin = rknng_offsets_[proxy];
             uint64_t end = rknng_offsets_[proxy + 1];
             for (uint64_t idx = begin; idx < end; idx++) {
@@ -2155,6 +2436,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 uint32_t rank = (uint32_t)(packed & rknng_rank_mask);
                 if (rank >= K_prime) break;
                 uint32_t cand = (uint32_t)(packed >> rknng_rank_bits_);
+                if (isMarkedDeleted(cand)) continue;
                 if (score_buf[cand] == 0.0f) candidates.push_back(cand);
                 score_buf[cand] += 1.0f;
             }
@@ -2188,6 +2470,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 _mm_prefetch(getDataByInternalId(candidates[i + 8]), _MM_HINT_T0);
 #endif
             uint32_t cand = candidates[i];
+            if (isMarkedDeleted(cand)) continue;
             dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
             float kdist_sq = getVerifyKdistSq(cand, k_idx);
             if (d <= kdist_sq) {
@@ -2234,6 +2517,9 @@ class HRNN : public AlgorithmInterface<dist_t> {
     {
         if (!rknng_built_)
             throw std::runtime_error("searchRknn_candidates: RKNNG not built");
+        if (K_prime == 0 || K_prime > K_knng_)
+            throw std::runtime_error(
+                "searchRknn_candidates: K_prime must be in [1, K_knng]");
         if (cur_element_count == 0) return {};
 
         thread_local std::vector<float> score_buf;
@@ -2263,8 +2549,14 @@ class HRNN : public AlgorithmInterface<dist_t> {
         }
 
         // Base layer search for m proxies
-        auto top_candidates = searchBaseLayerST<true>(
-            currObj, query_data, std::max(ef_search, m));
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        if (num_deleted_ == 0)
+            top_candidates = searchBaseLayerST<true>(
+                currObj, query_data, std::max(ef_search, m));
+        else
+            top_candidates = searchBaseLayerST<false>(
+                currObj, query_data, std::max(ef_search, m));
         while (top_candidates.size() > m)
             top_candidates.pop();
 
@@ -2273,6 +2565,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
         while (!top_candidates.empty()) {
             tableint proxy = top_candidates.top().second;
             top_candidates.pop();
+            if (isMarkedDeleted(proxy)) continue;
 
             uint64_t begin = rknng_offsets_[proxy];
             uint64_t end = rknng_offsets_[proxy + 1];
@@ -2281,6 +2574,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 uint32_t rank = (uint32_t)(packed & rknng_rank_mask);
                 if (rank >= K_prime) break;
                 uint32_t cand = (uint32_t)(packed >> rknng_rank_bits_);
+                if (isMarkedDeleted(cand)) continue;
                 if (score_buf[cand] == 0.0f) candidates.push_back(cand);
                 score_buf[cand] += 1.0f;
             }
@@ -2290,7 +2584,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
         std::vector<uint32_t> result;
         result.reserve(candidates.size());
         for (uint32_t cand : candidates) {
-            if (score_buf[cand] >= threshold)
+            if (!isMarkedDeleted(cand) && score_buf[cand] >= threshold)
                 result.push_back(cand);
             score_buf[cand] = 0.0f;
         }
@@ -2323,12 +2617,16 @@ class HRNN : public AlgorithmInterface<dist_t> {
         EntryT rknng_rank_mask) const
     {
         if (!rknng_built_) return {};
+        if (K_prime == 0 || K_prime > K_knng_)
+            throw std::runtime_error(
+                "reversePostingLookup: K_prime must be in [1, K_knng]");
 
         thread_local std::vector<float> score_buf;
         if (score_buf.size() < max_elements_) score_buf.resize(max_elements_, 0.0f);
 
         std::vector<uint32_t> candidates;
         for (tableint proxy : proxies) {
+            if (proxy >= cur_element_count || isMarkedDeleted(proxy)) continue;
             uint64_t begin = rknng_offsets_[proxy];
             uint64_t end = rknng_offsets_[proxy + 1];
             for (uint64_t idx = begin; idx < end; idx++) {
@@ -2336,6 +2634,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
                 uint32_t rank = (uint32_t)(packed & rknng_rank_mask);
                 if (rank >= K_prime) break;
                 uint32_t cand = (uint32_t)(packed >> rknng_rank_bits_);
+                if (isMarkedDeleted(cand)) continue;
                 if (score_buf[cand] == 0.0f) candidates.push_back(cand);
                 score_buf[cand] += 1.0f;
             }
@@ -2344,7 +2643,7 @@ class HRNN : public AlgorithmInterface<dist_t> {
         std::vector<uint32_t> result;
         result.reserve(candidates.size());
         for (uint32_t cand : candidates) {
-            if (score_buf[cand] >= threshold)
+            if (!isMarkedDeleted(cand) && score_buf[cand] >= threshold)
                 result.push_back(cand);
             score_buf[cand] = 0.0f;
         }
@@ -2533,6 +2832,9 @@ class HRNN : public AlgorithmInterface<dist_t> {
         return x_new;
     }
 
+    // ========================================================================
+    // Standard kNN search
+    // ========================================================================
 
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {

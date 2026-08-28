@@ -13,6 +13,7 @@ add_compile_options(-march=native -Wall -Wextra)
 
 find_package(OpenMP REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
+include(CTest)
 
 include_directories(include)
 
@@ -39,3 +40,9 @@ foreach(tgt IN ITEMS
         rknn_hnsw_sft_search)
     target_link_libraries(${tgt} Boost::program_options OpenMP::OpenMP_CXX)
 endforeach()
+
+if(BUILD_TESTING)
+    add_executable(hrnn_deletion_test tests/hrnn_deletion_test.cpp)
+    target_link_libraries(hrnn_deletion_test OpenMP::OpenMP_CXX)
+    add_test(NAME hrnn_deletion_test COMMAND hrnn_deletion_test)
+endif()

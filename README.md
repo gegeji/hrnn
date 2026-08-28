@@ -1,4 +1,4 @@
-# HRNN: A Hybrid Graph Index for Efficent Reverse k-Nearest Neighbor Search on High-Dimensional Vectors
+# HRNN: A Hybrid Graph Index for Efficient Reverse k-Nearest Neighbor Search on High-Dimensional Vectors
 
 ## 1. Repository Overview
 
@@ -44,7 +44,9 @@ and adds the HRNN index and several RkNN baselines for comparison.
 │       ├── space_ip.h         # vendored hnswlib
 │       ├── stop_condition.h   # vendored hnswlib
 │       └── visited_list_pool.h # vendored hnswlib
-├── src/                       # one .cpp per binary (8 total)
+├── src/                       # one .cpp per user-facing binary (8 total)
+├── tests/
+│   └── hrnn_deletion_test.cpp # deletion invariants and round-trip regression
 └── scripts/
     ├── gen_rknn_gt.py         # RkNN groundtruth (single-machine)
     ├── gen_rknn_gt_large.py   # RkNN groundtruth (GPU, ≥1M points)
@@ -85,10 +87,11 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-This produces 8 binaries under `build/`:
+This produces 8 user-facing binaries under `build/`:
 `hrnn_build`, `hrnn_search`, `hrnn_dynamic_test`,
 `hamg_build`, `hamg_search`, `knn_build`, `knn_search`,
-`rknn_hnsw_sft_search`.
+`rknn_hnsw_sft_search`. With `BUILD_TESTING=ON` (the default), it also builds
+`hrnn_deletion_test` for CTest.
 
 ### 3.2 Generate RkNN Groundtruth
 
@@ -114,7 +117,7 @@ Build:
     --index_path      /path/to/{ds}_hrnn.idx \
     --M               16 \
     --ef_construction 400 \
-    --K_knng          500 \
+    --K_knng          100 \
     --nn_iters        10 \
     --nn_sample       50 \
     --num_threads     $(nproc)
@@ -128,7 +131,7 @@ Search:
     --query      /path/to/{ds}_query.fbin \
     --gt         /path/to/{ds}_rknn_gt_k10.bin \
     --k          10 \
-    --K_prime    500 \
+    --K_prime    100 \
     --m          "1,3,5,10,20,50" \
     --ef_search  200
 ```
@@ -186,7 +189,7 @@ Both methods reuse a standard HNSW index built by `knn_build`:
     --query  /path/to/{ds}_query.fbin \
     --gt     /path/to/{ds}_rknn_gt_k10.bin \
     --split  0.5 \
-    --M 16 --ef_construction 400 --K_knng 500 \
+    --M 16 --ef_construction 400 --K_knng 100 \
     --k 10 --m 50 --ef_search 200 \
     --num_threads $(nproc)
 ```
@@ -194,6 +197,41 @@ Both methods reuse a standard HNSW index built by `knn_build`:
 End-to-end shell wrappers for build and search across a fixed parameter
 preset live in [`scripts/example_build.sh`](scripts/example_build.sh) and
 [`scripts/example_search.sh`](scripts/example_search.sh).
+
+### 3.8 Lightweight batch deletion
+
+`HRNN::deleteBatch(labels, k)` implements the paper's offline lightweight
+batch-deletion procedure. The caller must pause queries, insertions, and point
+updates for the entire call. The operation:
+
+1. marks the requested HNSW vertices deleted while preserving all graph links;
+2. stably removes deleted entries from every live ranked KNNG row; and
+3. rebuilds the reverse CSR as the exact transpose of the filtered rows.
+
+It performs no distance computation, graph search, neighbor refill, NNDescent
+step, or HNSW rewiring. A live point with fewer than `k` surviving stored
+neighbors has no valid `k`-th verification radius and is skipped during query
+verification.
+
+```cpp
+hnswlib::L2Space space(dimension);
+hnswlib::HRNN<float> index(&space, "/path/to/input_hrnn.idx");
+
+std::vector<hnswlib::labeltype> deleted_labels = {/* external labels */};
+auto stats = index.deleteBatch(deleted_labels, /*k=*/10);
+index.saveIndex("/path/to/deleted_hrnn.idx");
+```
+
+Deletion requires the full index representation. It is rejected after
+insertion/update maintenance, and insertion, point update, deleted-label
+revival, and deleted-slot reuse are rejected after deletion until the index is
+fully rebuilt. Additional offline deletion batches remain supported.
+
+Run the deletion regression test with:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
 
 
 

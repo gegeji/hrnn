@@ -22,7 +22,7 @@ cmake --build build -j"${THREADS}"
     --index_path      "${HRNN_IDX}" \
     --M               16 \
     --ef_construction 400 \
-    --K_knng          500 \
+    --K_knng          100 \
     --nn_iters        10 \
     --nn_sample       50 \
     --num_threads     "${THREADS}"
