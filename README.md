@@ -239,7 +239,7 @@ ctest --test-dir build --output-on-failure
 
 ```
 @misc{xia2026hrnnhybridgraphindex,
-      title={HRNN: A Hybrid Graph Index for Approximate Reverse k-Nearest Neighbor Search on High-Dimensional Vectors}, 
+      title={HRNN: A Hybrid Graph Index for Efficient Reverse k-Nearest Neighbor Search on High-Dimensional Vectors}, 
       author={Wenxuan Xia and Mingyu Yang and Wentao Li and Wei Wang},
       year={2026},
       eprint={2606.03225},
